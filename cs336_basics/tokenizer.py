@@ -154,10 +154,6 @@ def build_tokenizer(
     special_tokens: List[str],
     vocab_limit: int,
 ) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
-    # Convert special tokens to bytes and create a set for fast lookup
-    special_tokens_bytes = [st.encode("utf-8") for st in special_tokens]
-    special_set = set(special_tokens_bytes)
-    
     vocab: Dict[int, bytes] = {}
     rev_vocab: Dict[bytes, int] = {}
     merges: List[Tuple[bytes, bytes]] = []
@@ -175,50 +171,24 @@ def build_tokenizer(
         vocab[tot] = wb
         tot += 1
 
-    # Add special tokens to vocab
     for special_token in special_tokens:
         insert(special_token.encode("utf-8"))
 
-    # Convert word_freq to bytes and create proper tokenization
-    words = {}
-    tokenized = {}
-    for w, cnt in word_freq.items():
-        wb = w.encode("utf-8")
-        if not wb:
-            continue
-        words[wb] = words.get(wb, 0) + int(cnt)
-        
-        # Split by special tokens, then tokenize non-special segments into bytes
-        segs = _split_by_specials(wb, special_tokens_bytes)
-        toks = []
-        for seg in segs:
-            if seg in special_set:
-                toks.append(seg)  # Keep special token as atomic
-            else:
-                # Split into individual bytes
-                toks.extend([seg[i:i+1] for i in range(len(seg))])
-        tokenized[wb] = toks
-
-    # Build bytes_min_max based on tokenized result
+    bytes_freq: Dict[bytes, int] = {k.encode("utf-8"): v for k, v in word_freq.items()}
     bytes_min_max: Dict[bytes, Tuple[List[int], List[int]]] = {}
-    for wb in words.keys():
-        toks = tokenized[wb]
-        m = len(toks)
-        bytes_min_max[wb] = [*range(m)], [*range(m)]
 
-    # Build pair counts, skipping special tokens
+    for k, v in bytes_freq.items():
+        m = len(k)
+        bytes_min_max[k] = [*range(m)], [*range(m)]
+
     cnt_mp: Dict[Tuple[bytes, bytes], int] = {}
     pr_pos_mp: Dict[Tuple[bytes, bytes], Set[Tuple[bytes, int]]] = {}
-    for wb, cnt in words.items():
-        toks = tokenized[wb]
-        for i in range(len(toks) - 1):
-            left, right = toks[i], toks[i+1]
-            # Skip pairs involving special tokens
-            if left in special_set or right in special_set:
-                continue
-            pr = (left, right)
-            cnt_mp[pr] = cnt_mp.get(pr, 0) + cnt
-            pr_pos_mp[pr] = pr_pos_mp.get(pr, set()) | {(wb, i)}
+    for k, v in bytes_freq.items():
+        m = len(k)
+        for i in range(m - 1):
+            pr = (k[i:i + 1], k[i + 1:i + 2])
+            cnt_mp[pr] = cnt_mp.get(pr, 0) + v
+            pr_pos_mp[pr] = pr_pos_mp.get(pr, set()) | {(k, i)}
 
     tree = SortedList()
     for k, v in cnt_mp.items():
@@ -243,23 +213,28 @@ def build_tokenizer(
         cnt_mp[pr] = old - v
         if old - v > 0:
             tree.add((old - v, pr))
+        # if (wd, idx) not in pr_pos_mp.get(pr, set()):
+        #     print(f"fuck?")
         pr_pos_mp[pr] = pr_pos_mp.get(pr, set()) - {(wd, idx)}
 
+    # print(f'cnt_mp = {cnt_mp}')
+    # print(f'pr_pos_mp = {pr_pos_mp}')
+
     def find_next(word: bytes, idx: int) -> Tuple[bytes, int] | Tuple[None, None]:
-        toks = tokenized[word]
+        m = len(word)
         mi, ma = bytes_min_max[word]
         r = ma[idx] + 1
-        if r < len(toks):
+        if r < m:
             rr = ma[r]
-            return toks[r], r  # Return token, not byte slice
+            return word[r:rr + 1], r
         return None, None
 
     def find_prev(word: bytes, idx: int) -> Tuple[bytes, int] | Tuple[None, None]:
-        toks = tokenized[word]
+        m = len(word)
         mi, ma = bytes_min_max[word]
         if idx > 0:
-            l = mi[idx-1]
-            return toks[l], l  # Return token, not byte slice
+            l = mi[idx - 1]
+            return word[l:idx], l
         return None, None
 
     while tot < vocab_limit and len(tree) > 0:
@@ -268,106 +243,29 @@ def build_tokenizer(
             continue
         if cnt == 0:
             continue
-            
-        # Validate that the positions are still valid
-        pos = pr_pos_mp.get(pr, set())
-        valid_pos = set()
-        real_cnt = 0
-        for wd, idx in pos:
-            toks = tokenized[wd]
-            if idx >= 0 and idx + 1 < len(toks) and toks[idx] == pr[0] and toks[idx+1] == pr[1]:
-                valid_pos.add((wd, idx))
-                real_cnt += words[wd]
-        
-        # If real count doesn't match cached count, update and retry
-        if real_cnt != cnt:
-            if real_cnt > 0:
-                cnt_mp[pr] = real_cnt
-                tree.add((real_cnt, pr))
-                pr_pos_mp[pr] = valid_pos
-            else:
-                cnt_mp.pop(pr, None)
-                pr_pos_mp.pop(pr, None)
-            continue
-            
+        cnt_mp[pr] = 0  # 之前这里漏了更新
         merges.append(pr)
         merged_bytes = pr[0] + pr[1]
         rev_vocab[merged_bytes] = tot
         vocab[tot] = merged_bytes
         tot += 1
-        
-        # Apply the merge to tokenized first
-        affected_words = set()
-        for wd, idx in valid_pos:
-            affected_words.add(wd)
-            
-        for wd in affected_words:
-            toks = tokenized[wd]
-            new_toks = []
-            i = 0
-            while i < len(toks):
-                if i + 1 < len(toks) and toks[i] == pr[0] and toks[i+1] == pr[1]:
-                    new_toks.append(merged_bytes)
-                    i += 2
-                else:
-                    new_toks.append(toks[i])
-                    i += 1
-            tokenized[wd] = new_toks
-            
-            # Update bytes_min_max for this word
-            m = len(new_toks)
-            bytes_min_max[wd] = [*range(m)], [*range(m)]
-
-        # Then update pair counts based on new tokenized state
-        # Remove old pairs involving affected words
-        for pair in list(pr_pos_mp.keys()):
-            positions_to_remove = [(w, i) for w, i in pr_pos_mp[pair] if w in affected_words]
-            if positions_to_remove:
-                old_count = cnt_mp.get(pair, 0)
-                new_count = old_count - sum(words[w] for w, i in positions_to_remove)
-                
-                try:
-                    tree.discard((old_count, pair))
-                except:
-                    pass
-                    
-                if new_count > 0:
-                    cnt_mp[pair] = new_count
-                    tree.add((new_count, pair))
-                    pr_pos_mp[pair] -= set(positions_to_remove)
-                else:
-                    cnt_mp.pop(pair, None)
-                    pr_pos_mp.pop(pair, None)
-        
-        # Add new pairs from affected words
-        for wd in affected_words:
-            toks = tokenized[wd]
-            cnt = words[wd]
-            for i in range(len(toks) - 1):
-                left, right = toks[i], toks[i+1]
-                if left in special_set or right in special_set:
-                    continue
-                pair = (left, right)
-                
-                old_count = cnt_mp.get(pair, 0)
-                new_count = old_count + cnt
-                
-                try:
-                    tree.discard((old_count, pair))
-                except:
-                    pass
-                    
-                cnt_mp[pair] = new_count
-                tree.add((new_count, pair))
-                
-                if pair not in pr_pos_mp:
-                    pr_pos_mp[pair] = set()
-                pr_pos_mp[pair].add((wd, i))
-
-        # Clean up the merged pair
-        pr_pos_mp.pop(pr, None)
-        cnt_mp.pop(pr, None)
-
+        # pos = pr_pos_mp[pr]
+        pos = set(pr_pos_mp.get(pr, set()))
+        for wd, idx in pos:
+            mcnt = bytes_freq[wd]
+            ridx = bytes_min_max[wd][1][idx]
+            if ridx + 1 < len(wd):
+                ridx = bytes_min_max[wd][1][ridx + 1]
+            for i in range(idx, ridx + 1):
+                bytes_min_max[wd][1][i] = ridx
+                bytes_min_max[wd][0][i] = idx
+            (pre, pid), (nxt, nid) = find_prev(wd, idx), find_next(wd, idx)
+            if pre:
+                del_pr_cnt((pre, pr[0]), mcnt, wd, pid)
+                incr_pr_cnt((pre, merged_bytes), mcnt, wd, pid)
+            if nxt:
+                del_pr_cnt((pr[1], nxt), mcnt, wd, idx + len(pr[0]))    # 这里要用 idx + len(pr[0])
+                incr_pr_cnt((merged_bytes, nxt), mcnt, wd, idx)
     return vocab, merges
 
 
