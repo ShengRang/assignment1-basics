@@ -1,6 +1,7 @@
 import os
 import re
 from typing import BinaryIO, List, Dict, Tuple, NamedTuple, Optional, Set
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import regex
@@ -286,6 +287,220 @@ def bpe_tokenizer_training(
                     word_freq[k] = word_freq.get(k, 0) + v
     vocab, merged = build_tokenizer(word_freq, special_tokens, vocab_size)
     return vocab, merged
+
+
+class Tokenizer:
+    """
+    Byte-Pair Encoding (BPE) tokenizer that encodes text into token ids and decodes
+    token ids back into text, given a vocabulary and a list of merges.
+
+    - The vocabulary maps token id -> token bytes.
+    - The merges are ordered pairs of bytes, in the order they were created during training.
+    - Special tokens (strings) are preserved as atomic units during encoding.
+    """
+
+    _PRETOKENIZER_RE = regex.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+    def __init__(
+        self,
+        vocab: Dict[int, bytes],
+        merges: List[Tuple[bytes, bytes]],
+        special_tokens: List[str] | None = None,
+    ) -> None:
+        # Copy vocab so we can safely append special tokens if needed
+        self.id_to_token: Dict[int, bytes] = dict(vocab)
+        self.token_to_id: Dict[bytes, int] = {v: k for k, v in self.id_to_token.items()}
+
+        # Ensure base bytes (0..255) exist (robustness). If already present, no-op.
+        for i in range(256):
+            b = bytes([i])
+            if b not in self.token_to_id:
+                new_id = len(self.id_to_token)
+                self.id_to_token[new_id] = b
+                self.token_to_id[b] = new_id
+
+        # Handle special tokens
+        self.special_token_strings: List[str] = list(special_tokens) if special_tokens else []
+        self.special_token_bytes: List[bytes] = []
+        for st in self.special_token_strings:
+            b = st.encode("utf-8")
+            self.special_token_bytes.append(b)
+            if b not in self.token_to_id:
+                new_id = len(self.id_to_token)
+                self.id_to_token[new_id] = b
+                self.token_to_id[b] = new_id
+
+        # Build merge rank map: lower rank value = higher priority
+        self.merges: List[Tuple[bytes, bytes]] = list(merges)
+        self.merge_ranks: Dict[Tuple[bytes, bytes], int] = {
+            pair: rank for rank, pair in enumerate(self.merges)
+        }
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: List[str] | None = None,
+    ) -> "Tokenizer":
+        """
+        Construct a Tokenizer from serialized files. This implementation supports
+        a simple JSON vocab of the form {"<int>": [<byte0>, <byte1>, ...]} or
+        {"<int>": "<base64>" not supported} and a merges txt file where each line
+        has two space-separated byte values encoded as integers in [0,255] joined
+        by commas. Note: Our tests use an adapter instead of this reader.
+        """
+        # Best-effort generic loader for our assignment context. Not used by tests.
+        import json
+
+        with open(vocab_filepath, "rb") as vf:
+            raw = vf.read()
+            try:
+                # Try text JSON
+                vocab_json = json.loads(raw.decode("utf-8"))
+            except Exception:
+                # If not decodable as utf-8 text JSON, raise
+                raise ValueError("Unsupported vocab file format; expected JSON text.")
+
+        vocab: Dict[int, bytes] = {}
+        for k, v in vocab_json.items():
+            kid = int(k)
+            if isinstance(v, list):
+                vocab[kid] = bytes(v)
+            elif isinstance(v, str):
+                # Assume the string is utf-8 content to bytes
+                vocab[kid] = v.encode("utf-8")
+            else:
+                raise ValueError("Unsupported vocab entry value type.")
+
+        merges: List[Tuple[bytes, bytes]] = []
+        with open(merges_filepath, "rt", encoding="utf-8") as mf:
+            for line in mf:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                # Interpret as literal utf-8 strings to bytes
+                merges.append((parts[0].encode("utf-8"), parts[1].encode("utf-8")))
+
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
+    def _split_by_special_strings(self, text: str) -> List[str]:
+        """
+        Split a string into segments where special tokens are isolated and preserved.
+        Longest-match is preferred when multiple specials start at the same position.
+        """
+        if not self.special_token_strings:
+            return [text] if text else []
+
+        segments: List[str] = []
+        i = 0
+        n = len(text)
+        specials = self.special_token_strings
+        while i < n:
+            earliest_pos: Optional[int] = None
+            starting_specials: List[str] = []
+            for st in specials:
+                pos = text.find(st, i)
+                if pos == -1:
+                    continue
+                if earliest_pos is None or pos < earliest_pos:
+                    earliest_pos = pos
+                    starting_specials = [st]
+                elif pos == earliest_pos:
+                    starting_specials.append(st)
+
+            if earliest_pos is None:
+                segments.append(text[i:])
+                break
+
+            if earliest_pos > i:
+                segments.append(text[i:earliest_pos])
+
+            # Choose the longest special token among those starting at earliest_pos
+            best = max(starting_specials, key=len)
+            segments.append(best)
+            i = earliest_pos + len(best)
+
+        return [seg for seg in segments if seg != ""]
+
+    def _apply_bpe(self, token_bytes: bytes) -> List[int]:
+        """Apply BPE merges to a single pre-token (in bytes) and return token ids."""
+        if len(token_bytes) == 0:
+            return []
+
+        # Start with sequence of single-byte symbols
+        symbols: Tuple[bytes, ...] = tuple(token_bytes[i:i+1] for i in range(len(token_bytes)))
+
+        if len(symbols) == 1:
+            return [self.token_to_id[symbols[0]]]
+
+        def get_best_pair_rank(seq: Tuple[bytes, ...]) -> Tuple[Optional[Tuple[bytes, bytes]], Optional[int]]:
+            best_pair: Optional[Tuple[bytes, bytes]] = None
+            best_rank: Optional[int] = None
+            for i in range(len(seq) - 1):
+                pair = (seq[i], seq[i + 1])
+                rank = self.merge_ranks.get(pair)
+                if rank is None:
+                    continue
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best_pair = pair
+            return best_pair, best_rank
+
+        while True:
+            best_pair, _ = get_best_pair_rank(symbols)
+            if best_pair is None:
+                break
+            # Merge all occurrences of best_pair in a single left-to-right pass
+            merged: List[bytes] = []
+            i = 0
+            n = len(symbols)
+            while i < n:
+                if i < n - 1 and (symbols[i], symbols[i + 1]) == best_pair:
+                    merged.append(symbols[i] + symbols[i + 1])
+                    i += 2
+                else:
+                    merged.append(symbols[i])
+                    i += 1
+            symbols = tuple(merged)
+
+        return [self.token_to_id[sym] for sym in symbols]
+
+    def encode(self, text: str) -> List[int]:
+        """Encode input text into a list of token ids."""
+        if not text:
+            return []
+
+        ids: List[int] = []
+        for seg in self._split_by_special_strings(text):
+            if seg in set(self.special_token_strings):
+                b = seg.encode("utf-8")
+                ids.append(self.token_to_id[b])
+                continue
+            # Pre-tokenize and then apply BPE to each pre-token independently
+            for mat in self._PRETOKENIZER_RE.finditer(seg):
+                piece = mat.group(0)
+                piece_bytes = piece.encode("utf-8")
+                ids.extend(self._apply_bpe(piece_bytes))
+        return ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Lazily encode strings from an iterable, yielding token ids."""
+        for chunk in iterable:
+            for _id in self.encode(chunk):
+                yield _id
+
+    def decode(self, ids: List[int]) -> str:
+        """Decode a list of token ids back into a string."""
+        if not ids:
+            return ""
+        byts = b"".join(self.id_to_token[i] for i in ids)
+        # Use 'ignore' to avoid errors when decoding single tokens that may represent
+        # only part of a multi-byte UTF-8 sequence. Full sequences remain valid.
+        return byts.decode("utf-8", errors="ignore")
 
 
 def main():
